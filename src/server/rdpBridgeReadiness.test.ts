@@ -176,6 +176,7 @@ test('HypervisorController.startVmProcess routes Debian 12 to Native Container H
     assert.ok(info.hardwareProfile?.networkInterface?.includes(`127.0.0.1:${listenPort} -> 3389`));
   } finally {
     await ctrl.forceStop(vmId);
+    ctrl.cleanupVmArtifacts(vmId);
     assert.equal(process.pid > 0, true, 'forceStop on native VM must never kill host Node process');
   }
 });

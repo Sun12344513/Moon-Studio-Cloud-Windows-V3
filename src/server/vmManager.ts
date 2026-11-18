@@ -11,7 +11,13 @@ import { tunnelManager } from './tunnel';
 import { rdpServiceManager } from './rdpService';
 import { imageManager, isSupportedOsId, SupportedOsId } from './imageManager';
 import { getDefaultProvisioningPassword } from './credentialPolicy';
-import { dockurEngine, getAvailableDiskBytes, getOrderedMirrorsForOs } from './dockurEngine';
+import {
+  dockurEngine,
+  getAvailableDiskBytes,
+  getContainerMemAvailableBytes,
+  getOrderedMirrorsForOs,
+  isMemoryBackedOverlayfs,
+} from './dockurEngine';
 
 export type VmExtendedStatus =
   | 'Queued'
@@ -118,14 +124,19 @@ export class VmManager {
                 item.status === 'Booting' ||
                 item.status === 'Installing' ||
                 (item.status === 'Stopped' &&
-                  item.statusMessage === 'Tiến trình QEMU đã dừng sau khi máy chủ khởi động lại.'))
+                  (item.statusMessage === 'Tiến trình QEMU đã dừng sau khi máy chủ khởi động lại.' ||
+                   item.statusMessage === 'Đang tự động khởi động lại tiến trình QEMU...')) ||
+                (item.status === 'Failed' &&
+                  typeof item.failureReason === 'string' &&
+                  item.failureReason.includes('QEMU binary')))
             ) {
               // Child QEMU processes do not survive container restarts; mark for automatic resume
               item.isExternalVerified = false;
               this.autoResumeVmIds.add(item.id);
-              if (item.status === 'Installing' || item.status === 'Booting') {
+              if (item.status === 'Installing' || item.status === 'Booting' || item.status === 'Failed') {
                 item.status = 'Stopped';
-                item.statusMessage = 'Tiến trình QEMU đã dừng sau khi máy chủ khởi động lại.';
+                delete item.failureReason;
+                item.statusMessage = 'Đang tự động khởi động lại tiến trình QEMU...';
               }
             }
             this.vms.set(item.id, item);
@@ -233,6 +244,22 @@ export class VmManager {
     const def = imageManager.getOsDefinition(osId);
     const imgStatus = imageManager.getImageStatus(osId);
     if (imgStatus.status === 'READY') {
+      if (isMemoryBackedOverlayfs()) {
+        const memAvailBytes = getContainerMemAvailableBytes();
+        const minRuntimeBytes = (osId === 'windows-10' ? 2500 : 2000) * 1024 * 1024;
+        if (memAvailBytes > 0 && memAvailBytes < minRuntimeBytes) {
+          const availGib = (memAvailBytes / (1024 * 1024 * 1024)).toFixed(2);
+          const needGib = (minRuntimeBytes / (1024 * 1024 * 1024)).toFixed(2);
+          return {
+            ready: false,
+            code: 'INSUFFICIENT_HOST_MEMORY',
+            error: `RAM khả dụng trên container không đủ để chạy thêm ${def?.name || osId} (cần ít nhất ${needGib} GiB, còn trống ${availGib} GiB).`,
+            remediation: 'Hãy tắt hoặc xóa bớt máy ảo Windows đang chạy trước khi bật thêm máy mới.',
+            kvmAvailable: hasKvm,
+            dockerAvailable: dockerInfo.dockerDaemonRunning,
+          };
+        }
+      }
       return {
         ready: true,
         source: 'cached',
@@ -615,6 +642,9 @@ export class VmManager {
       if (procInfo.status === 'ERROR' || !procInfo.pid) {
         throw new Error(`Hypervisor process failed to enter RUNNING state for ${vm.osId}.`);
       }
+      if (procInfo.memoryMb && procInfo.memoryMb !== vm.memoryMb) {
+        vm.memoryMb = procInfo.memoryMb;
+      }
 
       // Verify QMP / QEMU liveness for Windows guests
       if (isWindows) {
@@ -747,11 +777,7 @@ export class VmManager {
         return;
       }
       const baseMsg = err instanceof Error ? err.message : String(err);
-      const hasKvm = fs.existsSync('/dev/kvm');
-      const fullReason =
-        isWindows && !hasKvm && !baseMsg.includes('/dev/kvm')
-          ? `${baseMsg} (Host notice: /dev/kvm nested virtualization is unavailable in Cloud Run gVisor container; KVM node or EXTERNAL_HYPERVISOR_URL required for production Windows 10/7 performance.)`
-          : baseMsg;
+      const fullReason = baseMsg;
 
       vm.status = 'Failed';
       vm.credentialsConfigured = false;
@@ -858,7 +884,17 @@ export class VmManager {
         }
 
         const provIso = path.resolve(process.cwd(), 'data', 'provisioning', vm.id, 'Autounattend.iso');
-        await hypervisor.startVmProcess({
+        let autounattendIsoPath: string | undefined =
+          !bootFromDiskOnly && fs.existsSync(provIso) ? provIso : undefined;
+        if (!bootFromDiskOnly && !autounattendIsoPath) {
+          const effectivePwd =
+            this.runtimePasswords.get(vm.id) ||
+            (vm.isPolicyManaged ? getDefaultProvisioningPassword() : vm.password);
+          if (effectivePwd && effectivePwd !== '[POLICY_MANAGED]' && effectivePwd !== '[VAULT_PROTECTED]') {
+            autounattendIsoPath = this.prepareWindowsGuestCredentialsPayload(vm, effectivePwd);
+          }
+        }
+        const procInfo = await hypervisor.startVmProcess({
           vmId: vm.id,
           osId: vm.osId,
           hostPort: vm.localPort,
@@ -866,9 +902,12 @@ export class VmManager {
           cores: vm.cores,
           isoPath,
           baseDiskPath,
-          autounattendIsoPath: !bootFromDiskOnly && fs.existsSync(provIso) ? provIso : undefined,
+          autounattendIsoPath,
           bootFromDiskOnly,
         });
+        if (procInfo.memoryMb && procInfo.memoryMb !== vm.memoryMb) {
+          vm.memoryMb = procInfo.memoryMb;
+        }
       }
 
       const tunnel = await tunnelManager.startTunnelForVm(vm.id, vm.localPort, {

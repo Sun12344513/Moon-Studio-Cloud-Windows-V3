@@ -31,13 +31,20 @@ export interface LogEntry {
 export function ServerLogsTerminal() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [isPaused, setIsPaused] = useState<boolean>(false);
+  const [autoScroll, setAutoScroll] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('moon_logs_autoscroll') === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [selectedLevel, setSelectedLevel] = useState<string>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [connectionStatus, setConnectionStatus] = useState<'CONNECTING' | 'CONNECTED' | 'DISCONNECTED'>('CONNECTING');
   const [copied, setCopied] = useState<boolean>(false);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
 
-  const terminalEndRef = useRef<HTMLDivElement>(null);
+  const logContainerRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const isPausedRef = useRef<boolean>(isPaused);
   isPausedRef.current = isPaused;
@@ -97,12 +104,24 @@ export function ServerLogsTerminal() {
     };
   }, []);
 
-  // Auto-scroll to latest log if not paused
-  useEffect(() => {
-    if (!isPaused && terminalEndRef.current) {
-      terminalEndRef.current.scrollIntoView({ behavior: 'smooth' });
+  const handleToggleAutoScroll = (checked: boolean) => {
+    setAutoScroll(checked);
+    try {
+      localStorage.setItem('moon_logs_autoscroll', String(checked));
+    } catch {
+      // ignore
     }
-  }, [logs, isPaused]);
+    if (checked && logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  };
+
+  // Internal container scroll only (never scrolls outer webpage) when autoScroll is enabled
+  useEffect(() => {
+    if (autoScroll && !isPaused && logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  }, [logs, autoScroll, isPaused]);
 
   // Load historical logs if needed
   const fetchHistoricalLogs = async () => {
@@ -213,6 +232,24 @@ export function ServerLogsTerminal() {
 
         {/* Action Controls */}
         <div className="flex items-center gap-2 flex-wrap">
+          <label
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer select-none ${
+              autoScroll
+                ? 'bg-[#2f8bff]/15 border-[#2f8bff]/50 text-white'
+                : 'bg-[#070b14] border-[#1e2a44] text-[#8a99ad] hover:text-white hover:border-[#2f8bff]'
+            }`}
+            title="Bật/tắt tự động cuộn trong khung logs khi có log mới (không làm nhảy trang web)"
+          >
+            <input
+              type="checkbox"
+              data-testid="logs-autoscroll-checkbox"
+              checked={autoScroll}
+              onChange={(e) => handleToggleAutoScroll(e.target.checked)}
+              className="w-3.5 h-3.5 rounded border-[#1e2a44] bg-[#0a101d] accent-[#2f8bff] cursor-pointer"
+            />
+            <span>Tự động cuộn</span>
+          </label>
+
           <button
             type="button"
             onClick={() => setIsPaused(!isPaused)}
@@ -314,6 +351,7 @@ export function ServerLogsTerminal() {
 
       {/* Terminal Output Body */}
       <div
+        ref={logContainerRef}
         className="bg-[#080d18] p-4 font-mono text-xs overflow-y-auto max-h-[380px] min-h-[220px] space-y-1.5 selection:bg-[#2f8bff]/30"
         tabIndex={0}
         aria-label="Server Logs Stream"
@@ -371,7 +409,6 @@ export function ServerLogsTerminal() {
             );
           })
         )}
-        <div ref={terminalEndRef} />
       </div>
 
       {/* Footer Status Bar */}

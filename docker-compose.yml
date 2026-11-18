@@ -1,16 +1,45 @@
 services:
+  moon-cloud:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        DOWNLOAD_WIN10: "false"
+        DOWNLOAD_WIN7: "false"
+    container_name: moon-cloud-windows
+    environment:
+      PORT: "3000"
+      KVM: "N"
+      ACCEL: "tcg"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  iso-downloader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: iso-downloader
+    container_name: moon-iso-downloader
+    profiles:
+      - iso
+    volumes:
+      - ./data/iso:/app/data/iso
+    entrypoint: ["/usr/local/bin/download-windows-iso.sh"]
+
   windows-10:
     image: dockurr/windows:latest
     container_name: moon-windows-10
     environment:
       VERSION: "10"
+      KVM: "N"
       RAM_SIZE: "4G"
       CPU_CORES: "2"
       DISK_SIZE: "40G"
       USERNAME: "Administrator"
-    devices:
-      - /dev/kvm
-      - /dev/net/tun
     cap_add:
       - NET_ADMIN
     ports:
@@ -27,13 +56,11 @@ services:
     container_name: moon-windows-7
     environment:
       VERSION: "7u"
+      KVM: "N"
       RAM_SIZE: "2G"
       CPU_CORES: "2"
       DISK_SIZE: "40G"
       USERNAME: "Administrator"
-    devices:
-      - /dev/kvm
-      - /dev/net/tun
     cap_add:
       - NET_ADMIN
     ports:

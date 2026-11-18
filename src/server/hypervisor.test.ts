@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { hypervisor } from './hypervisor';
 
 test('Hypervisor prepares virtual disk image correctly and cleans up artifacts', () => {
@@ -9,12 +10,21 @@ test('Hypervisor prepares virtual disk image correctly and cleans up artifacts',
     const diskPath = hypervisor.prepareDisk(vmId, 20);
     assert.ok(fs.existsSync(diskPath));
     assert.ok(diskPath.endsWith('.qcow2'));
+    if (fs.existsSync('/usr/bin/qemu-img')) {
+      const info = execFileSync('/usr/bin/qemu-img', ['info', diskPath], { encoding: 'utf8' });
+      assert.ok(info.includes('file format: qcow2'));
+      assert.ok(info.includes('compression type: zstd'));
+    }
   } finally {
     hypervisor.cleanupVmArtifacts(vmId);
   }
 });
 
-test('Hypervisor configures Windows 10 with Q35, UEFI OVMF, AHCI SATA, and Intel e1000e', async () => {
+test('Hypervisor configures Windows 10 with Q35, UEFI OVMF, AHCI SATA, and Intel e1000e', async (t) => {
+  if (!fs.existsSync('/usr/bin/qemu-system-x86_64')) {
+    t.skip('QEMU binary not installed on host; run inside Dockerfile runtime container');
+    return;
+  }
   const vmId = `test-win10-config-${Date.now()}`;
 
   try {
@@ -49,7 +59,11 @@ test('Hypervisor configures Windows 10 with Q35, UEFI OVMF, AHCI SATA, and Intel
   }
 });
 
-test('Hypervisor configures Windows 7 with SeaBIOS, IDE, and e1000', async () => {
+test('Hypervisor configures Windows 7 with SeaBIOS, IDE, and e1000', async (t) => {
+  if (!fs.existsSync('/usr/bin/qemu-system-x86_64')) {
+    t.skip('QEMU binary not installed on host; run inside Dockerfile runtime container');
+    return;
+  }
   const vmId = `test-win7-config-${Date.now()}`;
 
   try {
@@ -80,6 +94,42 @@ test('Hypervisor configures Windows 7 with SeaBIOS, IDE, and e1000', async () =>
   } finally {
     await hypervisor.forceStop(vmId);
     hypervisor.cleanupVmArtifacts(vmId);
+  }
+});
+
+test('Hypervisor attaches Windows 7 installer + Autounattend ISOs alongside live compress disk without IDE conflicts', async (t) => {
+  if (!fs.existsSync('/usr/bin/qemu-system-x86_64')) {
+    t.skip('QEMU binary not installed on host; run inside Dockerfile runtime container');
+    return;
+  }
+  const vmId = `test-win7-iso-${Date.now()}`;
+  const fakeIso = `/tmp/${vmId}-main.iso`;
+  const fakeAutoIso = `/tmp/${vmId}-auto.iso`;
+  fs.writeFileSync(fakeIso, Buffer.alloc(65536));
+  fs.writeFileSync(fakeAutoIso, Buffer.alloc(65536));
+
+  try {
+    const info = await hypervisor.startVmProcess({
+      vmId,
+      osId: 'windows-7',
+      hostPort: 3400,
+      memoryMb: 1024,
+      cores: 2,
+      isoPath: fakeIso,
+      autounattendIsoPath: fakeAutoIso,
+      bootFromDiskOnly: false,
+    });
+
+    assert.equal(info.bootMode, 'iso');
+    assert.ok(info.pid !== null && info.pid > 0);
+    const status = await hypervisor.queryStatus(vmId);
+    assert.ok(status !== null);
+    assert.ok(status.running === true || status.status === 'running');
+  } finally {
+    await hypervisor.forceStop(vmId);
+    hypervisor.cleanupVmArtifacts(vmId);
+    if (fs.existsSync(fakeIso)) fs.unlinkSync(fakeIso);
+    if (fs.existsSync(fakeAutoIso)) fs.unlinkSync(fakeAutoIso);
   }
 });
 

@@ -1,0 +1,9 @@
+node_modules
+dist
+data/disks/*.qcow2
+data/disks/*-OVMF_VARS.fd
+data/iso/*.downloading
+data/tpm
+data/logs
+.playwright-cli
+.env

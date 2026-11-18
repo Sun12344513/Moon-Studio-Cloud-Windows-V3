@@ -54,6 +54,8 @@ export interface HostInfrastructureReport {
     nestedVirtSupported: boolean;
     accelerationMode: 'kvm' | 'tcg' | 'none';
     dockerAvailable: boolean;
+    dockerfileReady: boolean;
+    requiresDevKvmForIso: boolean;
     dockurAutoIsoEnabled: boolean;
     externalHypervisorUrl: string | null;
   };
@@ -287,9 +289,11 @@ export function probeHostInfrastructure(): HostInfrastructureReport {
   const bottlenecks: string[] = [];
   const remediation: string[] = [];
 
+  const dockerfileSetup = dockurEngine.getDockerfileSetup();
+
   if (!devKvmExists) {
-    bottlenecks.push('/dev/kvm device is not present in container kernel (gVisor sandbox blocks nested KVM).');
-    remediation.push('Deploy on a Linux KVM host with docker-compose.yml (dockurr/windows) or configure EXTERNAL_HYPERVISOR_URL for hardware-accelerated Windows 10/7 performance.');
+    bottlenecks.push('/dev/kvm device is not present in container kernel (using Dockerfile KVM=N / QEMU TCG mode).');
+    remediation.push('Use the included Dockerfile (target: iso-downloader / runtime with KVM=N) or configure EXTERNAL_HYPERVISOR_URL if hardware KVM speed is needed.');
   }
 
   if (isGvisor) {
@@ -346,6 +350,8 @@ export function probeHostInfrastructure(): HostInfrastructureReport {
       nestedVirtSupported: kvmAvailable,
       accelerationMode,
       dockerAvailable: dockerRuntime.dockerDaemonRunning,
+      dockerfileReady: dockerfileSetup.dockerfilePresent,
+      requiresDevKvmForIso: dockerfileSetup.requiresDevKvm,
       dockurAutoIsoEnabled: true,
       externalHypervisorUrl,
     },

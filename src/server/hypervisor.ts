@@ -6,6 +6,7 @@ import { serverLogger } from './logger';
 import { SupportedOsId } from './imageManager';
 import { resolveOvmfPaths } from './infrastructure';
 import { vncBridgeManager } from './vncBridge';
+import { isMemoryBackedOverlayfs, getContainerMemAvailableBytes } from './dockurEngine';
 import {
   convertP6PpmToPng,
   buildMouseMoveEvents,
@@ -41,6 +42,7 @@ export class HypervisorController {
   private vms: Map<string, VmProcessInfo> = new Map();
   private nativePortBridges: Map<string, { port: number; server: net.Server }> = new Map();
   private screenshotLocks: Map<string, Promise<unknown>> = new Map();
+  private qemuInstallPromise: Promise<boolean> | null = null;
   private disksDir: string;
   private tpmDir: string;
 
@@ -85,11 +87,19 @@ export class HypervisorController {
       if (hasQemuImg) {
         try {
           if (baseDiskPath && fs.existsSync(baseDiskPath)) {
-            serverLogger.info('Hypervisor', `Creating persistent QCOW2 overlay from base disk ${baseDiskPath} -> ${diskPath}`, vmId);
-            execSync(`qemu-img create -f qcow2 -b "${baseDiskPath}" -F qcow2 "${diskPath}"`, { stdio: 'pipe' });
+            serverLogger.info('Hypervisor', `Creating persistent compressed QCOW2 overlay from base disk ${baseDiskPath} -> ${diskPath}`, vmId);
+            try {
+              execSync(`qemu-img create -f qcow2 -b "${baseDiskPath}" -F qcow2 -o compression_type=zstd,cluster_size=65536 "${diskPath}"`, { stdio: 'pipe' });
+            } catch {
+              execSync(`qemu-img create -f qcow2 -b "${baseDiskPath}" -F qcow2 "${diskPath}"`, { stdio: 'pipe' });
+            }
           } else {
-            serverLogger.info('Hypervisor', `Preparing virtual disk storage: ${diskPath} (${sizeGb}GB)`, vmId);
-            execSync(`qemu-img create -f qcow2 "${diskPath}" ${sizeGb}G`, { stdio: 'pipe' });
+            serverLogger.info('Hypervisor', `Preparing compressed QCOW2 virtual disk storage: ${diskPath} (${sizeGb}GB)`, vmId);
+            try {
+              execSync(`qemu-img create -f qcow2 -o compression_type=zstd,cluster_size=65536 "${diskPath}" ${sizeGb}G`, { stdio: 'pipe' });
+            } catch {
+              execSync(`qemu-img create -f qcow2 "${diskPath}" ${sizeGb}G`, { stdio: 'pipe' });
+            }
           }
           serverLogger.info('Hypervisor', `QCOW2 disk image initialized successfully: ${diskPath}`, vmId);
         } catch (err: unknown) {
@@ -170,6 +180,66 @@ export class HypervisorController {
   }
 
   /**
+   * Ensures QEMU/OVMF/swtpm toolchain is present on Debian/Ubuntu hosts if a container reset removed /usr/bin binaries.
+   */
+  public async ensureQemuToolchain(vmId?: string): Promise<boolean> {
+    const hasQemu = fs.existsSync('/usr/bin/qemu-system-x86_64');
+    const hasQemuImg = fs.existsSync('/usr/bin/qemu-img');
+    const ovmf = resolveOvmfPaths();
+    if (hasQemu && hasQemuImg && ovmf.codePath && ovmf.varsPath) {
+      return true;
+    }
+
+    const isRoot = typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+    if (!isRoot || !fs.existsSync('/usr/bin/apt-get')) {
+      return hasQemu;
+    }
+
+    if (this.qemuInstallPromise) {
+      return this.qemuInstallPromise;
+    }
+
+    this.qemuInstallPromise = (async () => {
+      serverLogger.info(
+        'Hypervisor',
+        'QEMU / OVMF binaries missing on container host — auto-installing qemu-system-x86, qemu-utils, ovmf, swtpm...',
+        vmId
+      );
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const proc = spawn(
+            'bash',
+            [
+              '-lc',
+              'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=120 --no-install-recommends qemu-system-x86 qemu-utils ovmf swtpm swtpm-tools genisoimage p7zip-full && apt-get clean && rm -rf /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*',
+            ],
+            { stdio: ['ignore', 'pipe', 'pipe'] }
+          );
+          let errTail = '';
+          proc.stderr?.on('data', (d) => {
+            errTail = `${errTail}${d.toString()}`.slice(-800);
+          });
+          proc.on('error', (err) => reject(err));
+          proc.on('close', (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`apt-get exited with code ${code}: ${errTail.trim()}`));
+          });
+        });
+        serverLogger.info('Hypervisor', 'QEMU / OVMF / swtpm toolchain installed successfully on host.', vmId);
+        return fs.existsSync('/usr/bin/qemu-system-x86_64');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        serverLogger.error('Hypervisor', `Auto-install of QEMU toolchain failed: ${msg}`, vmId);
+        return fs.existsSync('/usr/bin/qemu-system-x86_64');
+      } finally {
+        this.qemuInstallPromise = null;
+      }
+    })();
+
+    return this.qemuInstallPromise;
+  }
+
+  /**
    * Starts a real QEMU instance with OS-tailored virtual hardware profile
    */
   public async startVmProcess(options: {
@@ -184,7 +254,8 @@ export class HypervisorController {
     bootFromDiskOnly?: boolean;
   }): Promise<VmProcessInfo> {
     const { vmId, osId, hostPort } = options;
-    const memoryMb = options.memoryMb || (osId === 'windows-10' ? 4096 : 2048);
+    const requestedMemoryMb = options.memoryMb || (osId === 'windows-10' ? 4096 : 2048);
+    let memoryMb = requestedMemoryMb;
     const cores = options.cores || 2;
     const isoPath = options.isoPath;
     const autounattendIsoPath = options.autounattendIsoPath;
@@ -198,6 +269,10 @@ export class HypervisorController {
       }
       serverLogger.warn('Hypervisor', `VM ${vmId} (${osId}) is already running with PID ${current.pid}`, vmId);
       return current;
+    }
+
+    if (osId === 'windows-10' || osId === 'windows-7') {
+      await this.ensureQemuToolchain(vmId);
     }
 
     const diskPath = this.prepareDisk(vmId, osId === 'debian-12' ? 20 : 40, options.baseDiskPath);
@@ -214,14 +289,50 @@ export class HypervisorController {
 
     // Check if KVM is available
     const hasKvm = fs.existsSync('/dev/kvm');
-    const accelArg = hasKvm ? 'kvm' : 'tcg';
+    const accelArg = hasKvm ? 'kvm' : 'tcg,tb-size=64';
 
     if (!hasKvm) {
       serverLogger.warn(
         'Hypervisor',
-        `KVM acceleration (/dev/kvm) is not available in sandbox. Operating in QEMU TCG software emulation mode.`,
+        `KVM acceleration (/dev/kvm) is not available in sandbox. Operating in QEMU TCG software emulation mode (tb-size=64).`,
         vmId
       );
+    }
+
+    const attachInstallerIsoCheck = !bootFromDiskOnly && Boolean(isoPath && fs.existsSync(isoPath));
+    if ((osId === 'windows-10' || osId === 'windows-7') && isMemoryBackedOverlayfs()) {
+      const memAvailMb = Math.floor(getContainerMemAvailableBytes() / (1024 * 1024));
+      let diskExistingMb = 0;
+      try {
+        if (fs.existsSync(diskPath)) {
+          diskExistingMb = Math.floor(fs.statSync(diskPath).size / (1024 * 1024));
+        }
+      } catch {
+        // ignore
+      }
+      // On 12 GiB RAM-backed gVisor overlayfs, compressed Windows QCOW2 grows by ~3.5-4.0 GiB during setup.
+      const expectedAdditionalDiskMb = attachInstallerIsoCheck ? Math.max(0, 3600 - diskExistingMb) : 256;
+      const runtimeOverheadMb = 512;
+      if (osId === 'windows-7' && memoryMb > 1536 && memAvailMb < memoryMb + expectedAdditionalDiskMb + runtimeOverheadMb) {
+        memoryMb = 1536;
+        serverLogger.info(
+          'Hypervisor',
+          `Adjusted Windows 7 guest RAM from ${requestedMemoryMb}MB to ${memoryMb}MB (MemAvailable=${memAvailMb}MB on RAM-backed overlayfs) to preserve headroom for Windows Setup disk expansion.`,
+          vmId
+        );
+      } else if (osId === 'windows-10' && memoryMb > 2048 && memAvailMb < memoryMb + expectedAdditionalDiskMb + runtimeOverheadMb) {
+        memoryMb = Math.max(2048, Math.min(memoryMb, memAvailMb - expectedAdditionalDiskMb - runtimeOverheadMb));
+        serverLogger.info(
+          'Hypervisor',
+          `Adjusted Windows 10 guest RAM from ${requestedMemoryMb}MB to ${memoryMb}MB (MemAvailable=${memAvailMb}MB on RAM-backed overlayfs).`,
+          vmId
+        );
+      }
+      if (memAvailMb > 0 && memAvailMb < memoryMb + 640) {
+        throw new Error(
+          `INSUFFICIENT_HOST_MEMORY: Only ${memAvailMb} MiB container RAM available on RAM-backed filesystem; need at least ${memoryMb + 640} MiB to launch ${osId} safely without container OOM.`
+        );
+      }
     }
 
     let hasQemuBin = fs.existsSync('/usr/bin/qemu-system-x86_64');
@@ -302,8 +413,10 @@ export class HypervisorController {
 
       args.push(
         '-device', 'ahci,id=ahci',
-        '-drive', `id=disk0,file=${diskPath},format=qcow2,if=none`,
-        '-device', `ide-hd,drive=disk0,bus=ahci.0,bootindex=${attachInstallerIso ? 2 : 1}`,
+        '-blockdev', `node-name=disk0-file,driver=file,filename=${diskPath},aio=threads`,
+        '-blockdev', 'node-name=disk0-qcow2,driver=qcow2,file=disk0-file,discard=unmap',
+        '-blockdev', 'node-name=disk0-comp,driver=compress,file=disk0-qcow2',
+        '-device', `ide-hd,drive=disk0-comp,bus=ahci.0,bootindex=${attachInstallerIso ? 2 : 1}`,
         '-netdev', `user,id=net0,hostfwd=tcp::${hostPort}-:3389`,
         '-device', 'e1000e,netdev=net0',
         '-vga', 'std',
@@ -335,7 +448,7 @@ export class HypervisorController {
     } else if (osId === 'windows-7') {
       // Windows 7 SP1 Profile:
       // - Machine: standard PC (i440fx legacy chipset)
-      // - Storage: Native IDE/ATA (in-box Windows 7 driver)
+      // - Storage: Native IDE/ATA with live zstd/zlib QCOW2 compress filter
       // - Network: Intel e1000 (in-box Windows 7 driver)
       // - Display: Standard VGA (in-box Windows 7 driver)
       // - Input: USB Tablet (prevents cursor drift)
@@ -348,7 +461,7 @@ export class HypervisorController {
 
       serverLogger.info(
         'Hypervisor',
-        `Configuring Windows 7 Legacy PC profile: SeaBIOS, IDE disk, Intel e1000 NIC, Standard VGA (${accelArg}).`,
+        `Configuring Windows 7 Legacy PC profile: SeaBIOS, IDE disk (live QCOW2 compress), Intel e1000 NIC, Standard VGA (${accelArg}, RAM=${memoryMb}M).`,
         vmId
       );
 
@@ -365,7 +478,10 @@ export class HypervisorController {
         '-cpu', hasKvm ? 'host' : 'qemu64',
         '-m', `${memoryMb}M`,
         '-smp', `${cores}`,
-        '-drive', `file=${diskPath},format=qcow2,if=ide,index=0,media=disk`,
+        '-blockdev', `node-name=disk0-file,driver=file,filename=${diskPath},aio=threads`,
+        '-blockdev', 'node-name=disk0-qcow2,driver=qcow2,file=disk0-file,discard=unmap',
+        '-blockdev', 'node-name=disk0-comp,driver=compress,file=disk0-qcow2',
+        '-device', 'ide-hd,drive=disk0-comp,bus=ide.0,unit=0',
         '-netdev', `user,id=net0,hostfwd=tcp::${hostPort}-:3389`,
         '-device', 'e1000,netdev=net0',
         '-vga', 'std',
@@ -378,12 +494,18 @@ export class HypervisorController {
       ];
 
       if (attachInstallerIso && isoPath) {
-        args.push('-cdrom', isoPath);
-        args.push('-boot', 'once=d,order=cd');
+        args.push(
+          '-drive', `id=cdrom0,file=${isoPath},media=cdrom,readonly=on,if=none`,
+          '-device', 'ide-cd,drive=cdrom0,bus=ide.1,unit=0',
+          '-boot', 'once=d,order=cd'
+        );
         serverLogger.info('Hypervisor', `Attached Windows 7 installation ISO: ${isoPath}`, vmId);
 
         if (autounattendIsoPath && fs.existsSync(autounattendIsoPath)) {
-          args.push('-drive', `file=${autounattendIsoPath},media=cdrom,index=3,readonly=on`);
+          args.push(
+            '-drive', `id=cdrom1,file=${autounattendIsoPath},media=cdrom,readonly=on,if=none`,
+            '-device', 'ide-cd,drive=cdrom1,bus=ide.1,unit=1'
+          );
           serverLogger.info('Hypervisor', `Attached Windows 7 Autounattend ISO: ${autounattendIsoPath}`, vmId);
         }
       } else {
@@ -877,6 +999,14 @@ export class HypervisorController {
       } catch (err) {
         serverLogger.warn('Hypervisor', `Failed to capture framebuffer for VM ${vmId}: ${err}`);
         return null;
+      } finally {
+        try {
+          if (fs.existsSync(ppmPath)) {
+            fs.unlinkSync(ppmPath);
+          }
+        } catch {
+          // ignore
+        }
       }
     });
 

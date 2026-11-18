@@ -427,7 +427,7 @@ export default function App() {
 
             {/* Lifecycle Buttons */}
             <div className="flex items-center gap-1.5 flex-wrap">
-              {data?.status === 'Stopped' ? (
+              {data?.status === 'Stopped' || data?.status === 'Failed' ? (
                 <button
                   type="button"
                   disabled={actionLoading}

@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -5,6 +7,7 @@ import {
   getDockurVersionCode,
   getOrderedMirrorsForOs,
   buildDockurContainerSpec,
+  inspectDockerfileSetup,
 } from './dockurEngine';
 
 test('dockurEngine maps OS IDs to official dockurr/windows VERSION tags automatically', () => {
@@ -53,4 +56,23 @@ test('dockurEngine builds valid dockurr/windows docker run spec without manual I
   assert.ok(spec.args.includes('3390:3389/tcp'));
   assert.ok(spec.args.includes('8006:8006'));
   assert.equal(spec.args.some((a) => a.includes('ISO_PATH')), false);
+});
+
+test('Dockerfile and docker-compose.yml support ISO download and runtime without requiring /dev/kvm', () => {
+  const setup = inspectDockerfileSetup();
+  assert.equal(setup.dockerfilePresent, true);
+  assert.equal(setup.dockerComposePresent, true);
+  assert.equal(setup.requiresDevKvm, false);
+  assert.deepEqual(setup.supportedTargets, ['iso-downloader', 'runtime']);
+
+  const dockerfile = fs.readFileSync(path.join(process.cwd(), 'Dockerfile'), 'utf8');
+  assert.ok(dockerfile.includes('AS iso-downloader'));
+  assert.ok(dockerfile.includes('AS runtime'));
+  assert.ok(dockerfile.includes('KVM=N'));
+  assert.ok(dockerfile.includes('download-windows-iso.sh'));
+
+  const compose = fs.readFileSync(path.join(process.cwd(), 'docker-compose.yml'), 'utf8');
+  assert.equal(compose.includes('/dev/kvm'), false);
+  assert.ok(compose.includes('KVM: "N"'));
+  assert.ok(compose.includes('dockerfile: Dockerfile'));
 });

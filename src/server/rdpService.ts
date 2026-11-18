@@ -79,7 +79,7 @@ export class RdpServiceManager {
     if (!fs.existsSync('/usr/sbin/xrdp') || !fs.existsSync('/usr/bin/startxfce4') || !fs.existsSync('/usr/bin/dbus-daemon')) {
       serverLogger.info('RDPService', 'xrdp or desktop packages missing. Installing required packages...');
       const installCmd =
-        'rm -rf /var/cache/apt/archives/partial/* && mkdir -p /var/cache/apt/archives/partial && DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" --no-install-recommends xrdp xorgxrdp xfce4-session xfwm4 xfce4-panel xfdesktop4 thunar chromium falkon dbus dbus-x11 ssl-cert xfce4-terminal desktop-base';
+        'rm -rf /var/cache/apt/archives/partial/* && mkdir -p /var/cache/apt/archives/partial && DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" --no-install-recommends xrdp xorgxrdp xfce4-session xfwm4 xfce4-panel xfdesktop4 thunar chromium dbus dbus-x11 ssl-cert xfce4-terminal desktop-base && apt-get clean && rm -rf /var/cache/apt/archives/*.deb /var/cache/apt/archives/partial/*';
       let installed = false;
       for (let attempt = 1; attempt <= 2 && !installed; attempt++) {
         try {

@@ -26,11 +26,13 @@ export function CloudWebTerminal() {
   ]);
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const outputEndRef = useRef<HTMLDivElement>(null);
+  const terminalBoxRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    outputEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (history.length > 1 && terminalBoxRef.current) {
+      terminalBoxRef.current.scrollTop = terminalBoxRef.current.scrollHeight;
+    }
   }, [history]);
 
   const runCommand = async (cmdToRun: string) => {
@@ -148,6 +150,7 @@ export function CloudWebTerminal() {
 
       {/* Terminal Screen */}
       <div
+        ref={terminalBoxRef}
         className="p-4 bg-[#050810] font-mono text-xs overflow-y-auto max-h-[380px] min-h-[220px] space-y-3 selection:bg-[#2f8bff]/30"
         tabIndex={0}
         aria-label="Cloud Web Terminal Output"
@@ -199,7 +202,6 @@ export function CloudWebTerminal() {
             </div>
           ))
         )}
-        <div ref={outputEndRef} />
       </div>
 
       {/* Terminal Input Form */}

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execSync, spawn, ChildProcess } from 'node:child_process';
 import { serverLogger } from './logger';
@@ -29,6 +30,15 @@ export interface DockurContainerSpec {
   webPort: number;
   rdpPort: number;
   storageDir: string;
+}
+
+export interface DockerfileBuildStatus {
+  dockerfilePresent: boolean;
+  dockerComposePresent: boolean;
+  requiresDevKvm: boolean;
+  supportedTargets: string[];
+  isoDownloadCommand: string;
+  runtimeCommand: string;
 }
 
 /**
@@ -120,20 +130,73 @@ export function detectDockerRuntime(): DockurRuntimeInfo {
   };
 }
 
+export function inspectDockerfileSetup(rootDir: string = process.cwd()): DockerfileBuildStatus {
+  const dockerfilePresent = fs.existsSync(path.join(rootDir, 'Dockerfile'));
+  const dockerComposePresent = fs.existsSync(path.join(rootDir, 'docker-compose.yml'));
+  return {
+    dockerfilePresent,
+    dockerComposePresent,
+    requiresDevKvm: false,
+    supportedTargets: ['iso-downloader', 'runtime'],
+    isoDownloadCommand: 'docker compose --profile iso run --rm iso-downloader windows-10',
+    runtimeCommand: 'docker compose up -d --build moon-cloud',
+  };
+}
+
+export function isMemoryBackedOverlayfs(): boolean {
+  try {
+    if (!fs.existsSync('/proc/mounts')) return false;
+    const mounts = fs.readFileSync('/proc/mounts', 'utf8');
+    // Cloud Run / gVisor mounts root '/' on in-memory overlayfs (`none / overlay ...`)
+    return /^none\s+\/\s+overlay\b/m.test(mounts);
+  } catch {
+    return false;
+  }
+}
+
+export function getContainerMemAvailableBytes(): number {
+  try {
+    if (fs.existsSync('/proc/meminfo')) {
+      const info = fs.readFileSync('/proc/meminfo', 'utf8');
+      const availMatch = info.match(/^MemAvailable:\s+(\d+)\s+kB/m);
+      if (availMatch) {
+        return Number(availMatch[1]) * 1024;
+      }
+      const freeMatch = info.match(/^MemFree:\s+(\d+)\s+kB/m);
+      if (freeMatch) {
+        return Number(freeMatch[1]) * 1024;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return os.freemem();
+}
+
 export function getAvailableDiskBytes(targetDir: string): number {
+  let statfsBytes = 0;
   try {
     fs.mkdirSync(targetDir, { recursive: true });
     const stat = fs.statfsSync(targetDir);
-    return Number(stat.bavail) * Number(stat.bsize);
+    statfsBytes = Number(stat.bavail) * Number(stat.bsize);
   } catch {
     try {
       const dfOut = execSync(`df -B1 "${targetDir}" | tail -n 1`, { encoding: 'utf8', timeout: 3000 }).trim().split(/\s+/);
       const avail = Number(dfOut[3]);
-      return Number.isFinite(avail) ? avail : 0;
+      statfsBytes = Number.isFinite(avail) ? avail : 0;
     } catch {
-      return 0;
+      statfsBytes = 0;
     }
   }
+
+  // On Cloud Run gVisor RAM-backed overlayfs, every file written to / consumes container RAM.
+  if (isMemoryBackedOverlayfs()) {
+    const memAvail = getContainerMemAvailableBytes();
+    if (memAvail > 0 && (statfsBytes === 0 || memAvail < statfsBytes)) {
+      return memAvail;
+    }
+  }
+  return statfsBytes;
 }
 
 /**
@@ -216,6 +279,10 @@ export class DockurEngine {
 
   public getRuntimeInfo(): DockurRuntimeInfo {
     return detectDockerRuntime();
+  }
+
+  public getDockerfileSetup(): DockerfileBuildStatus {
+    return inspectDockerfileSetup();
   }
 
   public isDownloading(osId: SupportedOsId): boolean {
